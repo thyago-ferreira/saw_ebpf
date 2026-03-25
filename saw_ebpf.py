@@ -13,10 +13,8 @@ import argparse
 import ctypes
 import os
 import signal
-import struct
 import subprocess
 import sys
-import time
 
 # ---------------------------------------------------------------------------
 # Código eBPF (C) — compilado em JIT pelo BCC
@@ -154,6 +152,132 @@ def check_kernel_headers():
     print(f"[OK] Kernel {kver} — cabeçalhos encontrados.")
 
 
+def list_interfaces():
+    """Detecta interfaces de rede disponíveis no sistema via /sys/class/net."""
+    ifaces = []
+    net_dir = "/sys/class/net"
+    if not os.path.isdir(net_dir):
+        return ifaces
+    for name in sorted(os.listdir(net_dir)):
+        info = {"name": name, "state": "UNKNOWN", "ip": "—"}
+        # Estado operacional (UP/DOWN)
+        state_file = os.path.join(net_dir, name, "operstate")
+        if os.path.isfile(state_file):
+            with open(state_file) as f:
+                info["state"] = f.read().strip().upper()
+        # Endereço IP (via ip addr)
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "addr", "show", name],
+                stderr=subprocess.DEVNULL, text=True,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("inet "):
+                    info["ip"] = line.split()[1]
+                    break
+        except Exception:
+            pass
+        ifaces.append(info)
+    return ifaces
+
+
+def interactive_setup():
+    """Modo interativo: guia o usuário passo a passo para configurar a captura."""
+    print("=" * 60)
+    print("  SAW_eBPF — Configuração Interativa")
+    print("=" * 60)
+
+    # --- Passo 1: Interface ---
+    print("\n[Passo 1/3] Selecione a interface de rede")
+    print("-" * 60)
+    ifaces = list_interfaces()
+    if not ifaces:
+        print("[ERRO] Nenhuma interface de rede encontrada.")
+        sys.exit(1)
+
+    print(f"  {'#':<4} {'Interface':<16} {'Estado':<10} {'Endereço IP'}")
+    print(f"  {'—'*4} {'—'*16} {'—'*10} {'—'*20}")
+    for idx, iface in enumerate(ifaces, 1):
+        label = ""
+        if iface["name"] == "lo":
+            label = "  (loopback — testes locais)"
+        elif iface["state"] == "UP":
+            label = "  (ativa)"
+        print(f"  {idx:<4} {iface['name']:<16} {iface['state']:<10} {iface['ip']}{label}")
+
+    while True:
+        choice = input(f"\n  Digite o numero da interface [1-{len(ifaces)}]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(ifaces):
+            interface = ifaces[int(choice) - 1]["name"]
+            break
+        print("  Opcao invalida. Tente novamente.")
+
+    print(f"  -> Selecionado: {interface}")
+
+    # --- Passo 2: Porta ---
+    print(f"\n[Passo 2/3] Filtrar por porta?")
+    print("-" * 60)
+    print("  Portas comuns:")
+    print("    80/443  — HTTP/HTTPS (trafego web)")
+    print("    8080    — APIs e proxies reversos")
+    print("    9090    — Prometheus / GPS / servicos customizados")
+    print("    5432    — PostgreSQL")
+    print("    3306    — MySQL")
+    print("    0       — Todas as portas (modo generico)")
+
+    while True:
+        choice = input("\n  Digite a porta para filtrar [0 = todas]: ").strip()
+        if choice == "":
+            port = 0
+            break
+        if choice.isdigit() and 0 <= int(choice) <= 65535:
+            port = int(choice)
+            break
+        print("  Porta invalida. Use um valor entre 0 e 65535.")
+
+    if port:
+        print(f"  -> Filtrando porta: {port}")
+    else:
+        print(f"  -> Modo generico: capturando todas as portas")
+
+    # --- Passo 3: Tamanho do payload ---
+    print(f"\n[Passo 3/3] Tamanho maximo do payload")
+    print("-" * 60)
+    print("  Valores recomendados:")
+    print("    256   — Leve (apenas cabecalhos HTTP, ideal para alto volume)")
+    print("    1024  — Padrao (captura a maioria dos payloads de APIs REST)")
+    print("    2048  — Completo (requisicoes/respostas maiores, JSON extenso)")
+    print("    4096  — Maximo (protocolos binarios, arquivos em transito)")
+
+    while True:
+        choice = input("\n  Tamanho em bytes [padrao: 1024]: ").strip()
+        if choice == "":
+            size = 1024
+            break
+        if choice.isdigit() and 1 <= int(choice) <= 65536:
+            size = int(choice)
+            break
+        print("  Valor invalido. Use um numero entre 1 e 65536.")
+
+    print(f"  -> Payload maximo: {size} bytes")
+
+    # --- Resumo ---
+    mode = f"porta {port}" if port else "todas as portas"
+    print(f"\n{'=' * 60}")
+    print(f"  Resumo da configuracao:")
+    print(f"    Interface:  {interface}")
+    print(f"    Filtro:     {mode}")
+    print(f"    Payload:    {size} bytes")
+    print(f"{'=' * 60}")
+    confirm = input("  Iniciar captura? [S/n]: ").strip().lower()
+    if confirm in ("n", "nao", "no"):
+        print("  Captura cancelada.")
+        sys.exit(0)
+
+    return interface, port, size
+
+
 def ip_to_str(ip_int):
     """Converte u32 (network byte order) para string IPv4."""
     return "{}.{}.{}.{}".format(
@@ -203,14 +327,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Exemplos:
+  sudo python3 saw_ebpf.py                        # Modo interativo (guiado)
   sudo python3 saw_ebpf.py -i lo -s 2048          # Captura tudo na loopback
   sudo python3 saw_ebpf.py -i eth0 -p 9090        # Filtra porta 9090
   sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512   # HTTP, payload até 512 bytes
 """,
     )
     parser.add_argument(
-        "-i", "--interface", required=True,
-        help="Interface de rede (ex: lo, eth0)",
+        "-i", "--interface", default=None,
+        help="Interface de rede (ex: lo, eth0). Sem este argumento, entra no modo interativo.",
     )
     parser.add_argument(
         "-p", "--port", type=int, default=0,
@@ -226,20 +351,28 @@ Exemplos:
     check_root()
     check_kernel_headers()
 
+    # --- Modo interativo ou CLI direto ---
+    if args.interface is None:
+        interface, port, size = interactive_setup()
+    else:
+        interface = args.interface
+        port = args.port
+        size = args.size
+
     # Garantir que o tamanho seja potência de 2 (exigência do mask no eBPF)
     payload_size = 1
-    while payload_size < args.size:
+    while payload_size < size:
         payload_size <<= 1
-    if payload_size != args.size:
+    if payload_size != size:
         print(f"[INFO] Tamanho ajustado para {payload_size} (potência de 2 mais próxima).")
 
     # --- Injeção de variáveis no código C ---
     c_code = BPF_C_SOURCE
     c_code = c_code.replace("__MAX_PAYLOAD_SIZE__", str(payload_size))
-    c_code = c_code.replace("__TARGET_PORT__", str(args.port))
+    c_code = c_code.replace("__TARGET_PORT__", str(port))
 
-    mode = f"porta {args.port}" if args.port else "todas as portas (modo genérico)"
-    print(f"[*] Interface: {args.interface}")
+    mode = f"porta {port}" if port else "todas as portas (modo genérico)"
+    print(f"[*] Interface: {interface}")
     print(f"[*] Filtro: {mode}")
     print(f"[*] Payload máximo: {payload_size} bytes")
     print(f"[*] Compilando programa eBPF...")
@@ -256,9 +389,9 @@ Exemplos:
     bpf = BPF(text=c_code)
     fn = bpf.load_func("saw_socket_filter", BPF.SOCKET_FILTER)
 
-    BPF.attach_raw_socket(fn, args.interface)
+    BPF.attach_raw_socket(fn, interface)
 
-    print(f"[*] Socket filter anexado a '{args.interface}'. Capturando...")
+    print(f"[*] Socket filter anexado a '{interface}'. Capturando...")
     print("-" * 78)
 
     # --- Estrutura de evento ---

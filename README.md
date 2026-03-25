@@ -56,30 +56,83 @@ python3 -c "from bcc import BPF; print('BCC OK')"
 
 ## Como Rodar
 
-### Capturar todo o tráfego na loopback (ideal para APIs locais de teste)
+### Modo Interativo (recomendado para primeira vez)
+
+Basta executar sem argumentos. O SAW_eBPF detecta as interfaces do sistema e guia o usuário passo a passo:
 
 ```bash
+sudo python3 saw_ebpf.py
+```
+
+O assistente interativo apresenta:
+
+```
+============================================================
+  SAW_eBPF — Configuração Interativa
+============================================================
+
+[Passo 1/3] Selecione a interface de rede
+------------------------------------------------------------
+  #    Interface        Estado     Endereço IP
+  ———— ———————————————— —————————— ————————————————————
+  1    eth0             UP         192.168.1.10/24  (ativa)
+  2    lo               UNKNOWN    127.0.0.1/8  (loopback — testes locais)
+  3    docker0          DOWN       172.17.0.1/16
+
+  Digite o numero da interface [1-3]: 1
+
+[Passo 2/3] Filtrar por porta?
+------------------------------------------------------------
+  Portas comuns:
+    80/443  — HTTP/HTTPS (trafego web)
+    8080    — APIs e proxies reversos
+    9090    — Prometheus / GPS / servicos customizados
+    5432    — PostgreSQL
+    3306    — MySQL
+    0       — Todas as portas (modo generico)
+
+  Digite a porta para filtrar [0 = todas]: 9090
+
+[Passo 3/3] Tamanho maximo do payload
+------------------------------------------------------------
+  Valores recomendados:
+    256   — Leve (apenas cabecalhos HTTP, ideal para alto volume)
+    1024  — Padrao (captura a maioria dos payloads de APIs REST)
+    2048  — Completo (requisicoes/respostas maiores, JSON extenso)
+    4096  — Maximo (protocolos binarios, arquivos em transito)
+
+  Tamanho em bytes [padrao: 1024]: 2048
+
+============================================================
+  Resumo da configuracao:
+    Interface:  eth0
+    Filtro:     porta 9090
+    Payload:    2048 bytes
+============================================================
+  Iniciar captura? [S/n]: S
+```
+
+### Modo Direto (CLI)
+
+Para automação ou uso avançado, passe os argumentos diretamente:
+
+```bash
+# Capturar tudo na loopback (APIs locais de teste)
 sudo python3 saw_ebpf.py -i lo -s 2048
-```
 
-### Monitorar uma porta específica (ex: GPS na porta 9090)
-
-```bash
+# Monitorar uma porta específica (ex: GPS na porta 9090)
 sudo python3 saw_ebpf.py -i eth0 -p 9090
-```
 
-### Monitorar HTTP com payload reduzido
-
-```bash
+# Monitorar HTTP com payload reduzido
 sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512
 ```
 
 ### Opções da CLI
 
 ```
-uso: saw_ebpf.py [-h] -i INTERFACE [-p PORT] [-s SIZE]
+uso: saw_ebpf.py [-h] [-i INTERFACE] [-p PORT] [-s SIZE]
 
-  -i, --interface   Interface de rede (obrigatório). Ex: lo, eth0, ens33
+  -i, --interface   Interface de rede. Sem este argumento, entra no modo interativo.
   -p, --port        Porta para filtrar (padrão: 0 = todas as portas)
   -s, --size        Tamanho máximo do payload em bytes (padrão: 1024)
 ```
