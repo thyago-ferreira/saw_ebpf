@@ -100,13 +100,17 @@ int saw_socket_filter(struct __sk_buff *skb)
         return 0;
 
     u32 payload_len = pkt_len - payload_offset;
-
-    /* Limitar a MAX_PAYLOAD_SIZE - 1 para evitar que o bitmask
-       inline zere o valor quando payload_len == MAX_PAYLOAD_SIZE */
     if (payload_len >= MAX_PAYLOAD_SIZE)
         payload_len = MAX_PAYLOAD_SIZE - 1;
     if (payload_len == 0)
         return 0;
+
+    /* Bitmask + barreira de compilador: impede que o Clang otimize
+       e remova a prova de limite que o verificador 5.10 exige.
+       Sem o asm volatile, o Clang elimina o & por considerar redundante
+       após o if acima, mas o verificador não acompanha essa lógica. */
+    payload_len &= (MAX_PAYLOAD_SIZE - 1);
+    asm volatile("" : "+r"(payload_len));
 
     /* --- Reservar espaço no ring buffer --- */
     struct pkt_event *evt = events.ringbuf_reserve(sizeof(struct pkt_event));
@@ -120,12 +124,8 @@ int saw_socket_filter(struct __sk_buff *skb)
     evt->protocol  = protocol;
     evt->payload_len = payload_len;
 
-    /* Zerar payload e copiar dados disponíveis.
-       O bitmask INLINE é obrigatório: o verificador do Kernel 5.10
-       só aceita se a prova de limite estiver no argumento da chamada */
     __builtin_memset(evt->payload, 0, MAX_PAYLOAD_SIZE);
-    bpf_skb_load_bytes(skb, payload_offset, evt->payload,
-                       payload_len & (MAX_PAYLOAD_SIZE - 1));
+    bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len);
 
     events.ringbuf_submit(evt, 0);
     return 0;
