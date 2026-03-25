@@ -446,6 +446,10 @@ Exemplos:
         "--remote-port", type=int, default=9999,
         help="Porta de destino para transmissão TCP (default: 9999)",
     )
+    parser.add_argument(
+        "--output-file", default=None,
+        help="Salva eventos capturados em arquivo JSON-lines local (para leitura pelo saw_slm)",
+    )
     args = parser.parse_args()
 
     # --- Validações de ambiente ---
@@ -455,6 +459,7 @@ Exemplos:
     # --- Modo interativo ou CLI direto ---
     if args.interface is None:
         interface, port, size, remote_host, remote_port = interactive_setup()
+        output_file = None
     else:
         if args.remote_host is None:
             parser.error("--remote-host é obrigatório. Ex: --remote-host 127.0.0.1")
@@ -463,6 +468,7 @@ Exemplos:
         size = args.size
         remote_host = args.remote_host
         remote_port = args.remote_port
+        output_file = args.output_file
 
     # Tamanho máximo do payload (usado no Python para truncar a saída)
     payload_size = size
@@ -480,6 +486,8 @@ Exemplos:
     print(f"[*] Filtro: {mode}")
     print(f"[*] Payload máximo: {payload_size} bytes")
     print(f"[*] Compilando programa eBPF...")
+    if output_file:
+        print(f"[*] Gravando eventos em: {output_file}")
 
     # --- Importar BCC aqui para dar erro legível se não estiver instalado ---
     try:
@@ -561,6 +569,11 @@ Exemplos:
             "payload_string": clean,
         }
         publisher.send(event_json)
+
+        # Gravar no arquivo local para o saw_slm
+        if output_file:
+            with open(output_file, "a") as f:
+                f.write(json.dumps(event_json, ensure_ascii=False) + "\n")
 
     # --- Registrar callback no perf buffer ---
     bpf["events"].open_perf_buffer(handle_event, page_cnt=64)
