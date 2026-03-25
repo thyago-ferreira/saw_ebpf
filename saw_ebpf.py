@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SAW_eBPF — Monitoramento Passivo de Rede via eBPF (Kernel 5.10+)
+
+Utiliza socket_filter + BPF_MAP_TYPE_RINGBUF para captura de payloads
+TCP/UDP com saída simultânea em hexadecimal e UTF-8.
+
+Requisitos: Debian com Kernel >=5.10, BCC (python3-bcc), privilégios root.
+"""
+
+import argparse
+import ctypes
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Código eBPF (C) — compilado em JIT pelo BCC
+# Os placeholders __MAX_PAYLOAD_SIZE__ e __TARGET_PORT__ são substituídos
+# pelo loader antes da compilação.
+# ---------------------------------------------------------------------------
+BPF_C_SOURCE = r"""
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/ipv6.h>
+#include <uapi/linux/tcp.h>
+#include <uapi/linux/udp.h>
+
+#define MAX_PAYLOAD_SIZE __MAX_PAYLOAD_SIZE__
+#define TARGET_PORT      __TARGET_PORT__
+
+/* Estrutura enviada ao user-space via ring buffer */
+struct pkt_event {
+    u32 src_ip;
+    u32 dst_ip;
+    u16 src_port;
+    u16 dst_port;
+    u8  protocol;       /* IPPROTO_TCP ou IPPROTO_UDP */
+    u16 payload_len;
+    u8  payload[MAX_PAYLOAD_SIZE];
+};
+
+/* Ring buffer — alta performance, sem perda por contention */
+BPF_RINGBUF_OUTPUT(events, 1 << 20);  /* 1 MiB */
+
+int saw_socket_filter(struct __sk_buff *skb)
+{
+    /* --- Cabeçalho Ethernet --- */
+    u16 eth_proto;
+    bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_proto), &eth_proto, 2);
+
+    /* Aceitar apenas IPv4 */
+    if (eth_proto != htons(ETH_P_IP))
+        return 0;
+
+    /* --- Cabeçalho IP --- */
+    struct iphdr iph;
+    bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &iph, sizeof(iph));
+
+    u8 protocol = iph.protocol;
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+        return 0;
+
+    u32 ip_hdr_len = iph.ihl << 2;
+    u32 l4_offset  = sizeof(struct ethhdr) + ip_hdr_len;
+
+    /* --- Cabeçalho L4 (TCP / UDP) --- */
+    u16 src_port = 0, dst_port = 0;
+    u32 payload_offset = 0;
+
+    if (protocol == IPPROTO_TCP) {
+        struct tcphdr tcph;
+        bpf_skb_load_bytes(skb, l4_offset, &tcph, sizeof(tcph));
+        src_port = ntohs(tcph.source);
+        dst_port = ntohs(tcph.dest);
+        u32 tcp_hdr_len = tcph.doff << 2;
+        payload_offset = l4_offset + tcp_hdr_len;
+    } else {
+        struct udphdr udph;
+        bpf_skb_load_bytes(skb, l4_offset, &udph, sizeof(udph));
+        src_port = ntohs(udph.source);
+        dst_port = ntohs(udph.dest);
+        payload_offset = l4_offset + sizeof(struct udphdr);
+    }
+
+    /* --- Filtro de porta (0 = captura tudo) --- */
+    #if TARGET_PORT != 0
+    if (src_port != TARGET_PORT && dst_port != TARGET_PORT)
+        return 0;
+    #endif
+
+    /* --- Calcular tamanho do payload --- */
+    u32 pkt_len = skb->len;
+    if (payload_offset >= pkt_len)
+        return 0;
+
+    u32 payload_len = pkt_len - payload_offset;
+    if (payload_len > MAX_PAYLOAD_SIZE)
+        payload_len = MAX_PAYLOAD_SIZE;
+
+    /* --- Reservar espaço no ring buffer --- */
+    struct pkt_event *evt = events.ringbuf_reserve(sizeof(struct pkt_event));
+    if (!evt)
+        return 0;
+
+    evt->src_ip    = iph.saddr;
+    evt->dst_ip    = iph.daddr;
+    evt->src_port  = src_port;
+    evt->dst_port  = dst_port;
+    evt->protocol  = protocol;
+    evt->payload_len = payload_len;
+
+    /* Zerar payload e copiar dados disponíveis */
+    __builtin_memset(evt->payload, 0, MAX_PAYLOAD_SIZE);
+    bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len & (MAX_PAYLOAD_SIZE - 1));
+
+    events.ringbuf_submit(evt, 0);
+    return 0;
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Constantes
+# ---------------------------------------------------------------------------
+IPPROTO_TCP = 6
+IPPROTO_UDP = 17
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def check_root():
+    """Verifica se o processo roda como root."""
+    if os.geteuid() != 0:
+        print("[ERRO] SAW_eBPF requer privilégios de root.")
+        print("       Execute: sudo python3 saw_ebpf.py ...")
+        sys.exit(1)
+
+
+def check_kernel_headers():
+    """Verifica se os cabeçalhos do kernel estão instalados."""
+    uname = os.uname()
+    kver = uname.release
+    header_path = f"/lib/modules/{kver}/build"
+    if not os.path.isdir(header_path):
+        print(f"[AVISO] Cabeçalhos do kernel não encontrados em {header_path}")
+        print(f"        Instale com: sudo apt install linux-headers-{kver}")
+        sys.exit(1)
+    print(f"[OK] Kernel {kver} — cabeçalhos encontrados.")
+
+
+def ip_to_str(ip_int):
+    """Converte u32 (network byte order) para string IPv4."""
+    return "{}.{}.{}.{}".format(
+        ip_int & 0xFF,
+        (ip_int >> 8) & 0xFF,
+        (ip_int >> 16) & 0xFF,
+        (ip_int >> 24) & 0xFF,
+    )
+
+
+def format_hex(data, width=16):
+    """Formata bytes em linhas hexadecimais estilo hexdump."""
+    lines = []
+    for i in range(0, len(data), width):
+        chunk = data[i:i + width]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"  {i:04x}  {hex_part:<{width * 3}}  |{ascii_part}|")
+    return "\n".join(lines)
+
+
+def build_event_struct(max_payload_size):
+    """Cria ctypes struct alinhada com a struct pkt_event do eBPF."""
+
+    class PktEvent(ctypes.Structure):
+        _fields_ = [
+            ("src_ip",      ctypes.c_uint32),
+            ("dst_ip",      ctypes.c_uint32),
+            ("src_port",    ctypes.c_uint16),
+            ("dst_port",    ctypes.c_uint16),
+            ("protocol",    ctypes.c_uint8),
+            ("_pad",        ctypes.c_uint8),       # padding natural
+            ("payload_len", ctypes.c_uint16),
+            ("payload",     ctypes.c_uint8 * max_payload_size),
+        ]
+
+    return PktEvent
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SAW_eBPF — Monitoramento passivo de rede via eBPF",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Exemplos:
+  sudo python3 saw_ebpf.py -i lo -s 2048          # Captura tudo na loopback
+  sudo python3 saw_ebpf.py -i eth0 -p 9090        # Filtra porta 9090
+  sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512   # HTTP, payload até 512 bytes
+""",
+    )
+    parser.add_argument(
+        "-i", "--interface", required=True,
+        help="Interface de rede (ex: lo, eth0)",
+    )
+    parser.add_argument(
+        "-p", "--port", type=int, default=0,
+        help="Porta para filtrar (default: 0 = todas)",
+    )
+    parser.add_argument(
+        "-s", "--size", type=int, default=1024,
+        help="Tamanho máximo do payload capturado em bytes (default: 1024)",
+    )
+    args = parser.parse_args()
+
+    # --- Validações de ambiente ---
+    check_root()
+    check_kernel_headers()
+
+    # Garantir que o tamanho seja potência de 2 (exigência do mask no eBPF)
+    payload_size = 1
+    while payload_size < args.size:
+        payload_size <<= 1
+    if payload_size != args.size:
+        print(f"[INFO] Tamanho ajustado para {payload_size} (potência de 2 mais próxima).")
+
+    # --- Injeção de variáveis no código C ---
+    c_code = BPF_C_SOURCE
+    c_code = c_code.replace("__MAX_PAYLOAD_SIZE__", str(payload_size))
+    c_code = c_code.replace("__TARGET_PORT__", str(args.port))
+
+    mode = f"porta {args.port}" if args.port else "todas as portas (modo genérico)"
+    print(f"[*] Interface: {args.interface}")
+    print(f"[*] Filtro: {mode}")
+    print(f"[*] Payload máximo: {payload_size} bytes")
+    print(f"[*] Compilando programa eBPF...")
+
+    # --- Importar BCC aqui para dar erro legível se não estiver instalado ---
+    try:
+        from bcc import BPF
+    except ImportError:
+        print("[ERRO] Biblioteca BCC não encontrada.")
+        print("       Instale com: sudo apt install python3-bcc bpfcc-tools")
+        sys.exit(1)
+
+    # --- Compilar e anexar ao socket ---
+    bpf = BPF(text=c_code)
+    fn = bpf.load_func("saw_socket_filter", BPF.SOCKET_FILTER)
+
+    from bcc import BPF
+    BPF.attach_raw_socket(fn, args.interface)
+
+    print(f"[*] Socket filter anexado a '{args.interface}'. Capturando...")
+    print("-" * 78)
+
+    # --- Estrutura de evento ---
+    PktEvent = build_event_struct(payload_size)
+    pkt_count = 0
+
+    # --- Callback do ring buffer ---
+    def handle_event(ctx, data, size):
+        nonlocal pkt_count
+        pkt_count += 1
+        evt = ctypes.cast(data, ctypes.POINTER(PktEvent)).contents
+
+        proto_name = "TCP" if evt.protocol == IPPROTO_TCP else "UDP"
+        src = f"{ip_to_str(evt.src_ip)}:{evt.src_port}"
+        dst = f"{ip_to_str(evt.dst_ip)}:{evt.dst_port}"
+        plen = evt.payload_len
+
+        payload_bytes = bytes(evt.payload[:plen])
+
+        # --- Saída formatada ---
+        print(f"\n{'='*78}")
+        print(f"  PKT #{pkt_count}  |  {proto_name}  {src} -> {dst}  |  {plen} bytes")
+        print(f"{'='*78}")
+
+        # Hexadecimal
+        print("\n  [HEX]")
+        print(format_hex(payload_bytes))
+
+        # UTF-8 / String (substitui bytes não-imprimíveis por '.')
+        try:
+            text = payload_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            text = payload_bytes.decode("latin-1", errors="replace")
+        # Limpar caracteres de controle para exibição
+        clean = "".join(c if c.isprintable() or c in ("\n", "\r", "\t") else "." for c in text)
+        print(f"\n  [UTF-8/STRING]")
+        print(f"  {clean}")
+
+    # --- Registrar callback no ring buffer ---
+    bpf["events"].open_ring_buffer(handle_event)
+
+    # --- Tratamento de sinal para Fail-Open ---
+    running = True
+
+    def signal_handler(sig, frame):
+        nonlocal running
+        print(f"\n\n[!] Sinal recebido ({sig}). Removendo ganchos do kernel (Fail-Open)...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # --- Loop principal ---
+    try:
+        while running:
+            bpf.ring_buffer_poll(timeout=100)
+    except Exception as e:
+        print(f"\n[ERRO] Exceção no loop principal: {e}")
+    finally:
+        # Fail-Open: BCC remove automaticamente os programas eBPF ao sair,
+        # garantindo que o sistema legado não seja afetado.
+        print(f"\n[*] Total de pacotes capturados: {pkt_count}")
+        print("[*] Programa eBPF removido. Sistema limpo (Fail-Open).")
+        bpf.cleanup()
+        print("[*] SAW_eBPF encerrado.")
+
+
+if __name__ == "__main__":
+    main()
