@@ -116,7 +116,8 @@ int saw_socket_filter(struct __sk_buff *skb)
 
     /* Zerar payload e copiar dados disponíveis */
     __builtin_memset(evt->payload, 0, MAX_PAYLOAD_SIZE);
-    bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len & (MAX_PAYLOAD_SIZE - 1));
+    /* O verificador do 5.10+ aceita o limite se payload_len for validado antes */
+    bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len);
 
     events.ringbuf_submit(evt, 0);
     return 0;
@@ -255,7 +256,6 @@ Exemplos:
     bpf = BPF(text=c_code)
     fn = bpf.load_func("saw_socket_filter", BPF.SOCKET_FILTER)
 
-    from bcc import BPF
     BPF.attach_raw_socket(fn, args.interface)
 
     print(f"[*] Socket filter anexado a '{args.interface}'. Capturando...")
