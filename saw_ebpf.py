@@ -147,7 +147,10 @@ def check_kernel_headers():
     header_path = f"/lib/modules/{kver}/build"
     if not os.path.isdir(header_path):
         print(f"[AVISO] Cabeçalhos do kernel não encontrados em {header_path}")
-        print(f"        Instale com: sudo apt install linux-headers-{kver}")
+        print(f"        Execute o instalador automático: sudo bash install.sh")
+        print(f"        Ou instale manualmente:")
+        print(f"          sudo apt update && sudo apt upgrade -y && sudo reboot")
+        print(f"          sudo apt install linux-headers-$(uname -r)")
         sys.exit(1)
     print(f"[OK] Kernel {kver} — cabeçalhos encontrados.")
 
@@ -382,7 +385,10 @@ Exemplos:
         from bcc import BPF
     except ImportError:
         print("[ERRO] Biblioteca BCC não encontrada.")
-        print("       Instale com: sudo apt install python3-bcc bpfcc-tools")
+        print("       Execute o instalador automático: sudo bash install.sh")
+        print("       Ou instale manualmente:")
+        print("         Debian: sudo apt install python3-bpfcc bpfcc-tools")
+        print("         Ubuntu: sudo apt install python3-bcc bpfcc-tools")
         sys.exit(1)
 
     # --- Compilar e anexar ao socket ---

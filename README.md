@@ -25,23 +25,27 @@ Agente de captura de pacotes de alta performance utilizando **eBPF socket_filter
 
 ## Instalação
 
-### 1. Clonar o repositório
+Copie e cole os 3 comandos abaixo no terminal da máquina monitorada:
 
 ```bash
 git clone https://github.com/thyago-ferreira/saw_ebpf.git
 cd saw_ebpf
+sudo bash install.sh
 ```
 
-### 2. Instalar dependências (Debian/Ubuntu)
+O instalador automático detecta a distribuição (Debian/Ubuntu), instala os cabeçalhos do kernel corretos, o BCC com o nome de pacote certo para o seu sistema, e valida tudo antes de finalizar.
+
+> **Nota:** Se o kernel estiver desatualizado, o instalador oferece atualizar e reiniciar automaticamente. Após o reboot, execute `sudo bash install.sh` novamente para concluir.
+
+### Instalação manual (alternativa)
 
 ```bash
-sudo apt update
-sudo apt install -y linux-headers-$(uname -r) python3-bcc bpfcc-tools
-```
-
-### 3. Verificar instalação
-
-```bash
+git clone https://github.com/thyago-ferreira/saw_ebpf.git
+cd saw_ebpf
+sudo apt update && sudo apt upgrade -y
+sudo reboot  # se o kernel foi atualizado
+sudo apt install -y linux-headers-$(uname -r) python3-bpfcc bpfcc-tools  # Debian
+# ou: sudo apt install -y linux-headers-$(uname -r) python3-bcc bpfcc-tools  # Ubuntu
 python3 -c "from bcc import BPF; print('BCC OK')"
 ```
 
