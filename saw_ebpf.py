@@ -100,8 +100,18 @@ int saw_socket_filter(struct __sk_buff *skb)
         return 0;
 
     u32 payload_len = pkt_len - payload_offset;
-    if (payload_len > MAX_PAYLOAD_SIZE)
-        payload_len = MAX_PAYLOAD_SIZE;
+
+    /* Limitar ao tamanho máximo - 1 para que o bitmask não zere o valor
+       quando payload_len == MAX_PAYLOAD_SIZE (potência de 2) */
+    if (payload_len >= MAX_PAYLOAD_SIZE)
+        payload_len = MAX_PAYLOAD_SIZE - 1;
+
+    /* Bitmask obrigatório: o verificador do Kernel 5.10 exige prova
+       explícita de que o valor é positivo e limitado */
+    payload_len &= (MAX_PAYLOAD_SIZE - 1);
+
+    if (payload_len == 0)
+        return 0;
 
     /* --- Reservar espaço no ring buffer --- */
     struct pkt_event *evt = events.ringbuf_reserve(sizeof(struct pkt_event));
@@ -117,7 +127,6 @@ int saw_socket_filter(struct __sk_buff *skb)
 
     /* Zerar payload e copiar dados disponíveis */
     __builtin_memset(evt->payload, 0, MAX_PAYLOAD_SIZE);
-    /* O verificador do 5.10+ aceita o limite se payload_len for validado antes */
     bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len);
 
     events.ringbuf_submit(evt, 0);
