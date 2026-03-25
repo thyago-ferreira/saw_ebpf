@@ -27,7 +27,7 @@ import time
 BPF_C_SOURCE = r"""
 #include <uapi/linux/if_ether.h>
 #include <uapi/linux/ip.h>
-#include <uapi/linux/ipv6.h>
+#include <uapi/linux/in.h>
 #include <uapi/linux/tcp.h>
 #include <uapi/linux/udp.h>
 
@@ -46,7 +46,7 @@ struct pkt_event {
 };
 
 /* Ring buffer — alta performance, sem perda por contention */
-BPF_RINGBUF_OUTPUT(events, 1 << 20);  /* 1 MiB */
+BPF_RINGBUF_OUTPUT(events, 256);  /* 256 páginas = 1 MiB */
 
 int saw_socket_filter(struct __sk_buff *skb)
 {
