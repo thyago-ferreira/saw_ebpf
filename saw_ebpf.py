@@ -11,10 +11,13 @@ Requisitos: Debian com Kernel >=5.10, BCC (python3-bcc), privilégios root.
 
 import argparse
 import ctypes
+import json
 import os
 import signal
+import socket
 import subprocess
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Código eBPF (C) — compilado em JIT pelo BCC
@@ -129,6 +132,78 @@ IPPROTO_TCP = 6
 IPPROTO_UDP = 17
 
 # ---------------------------------------------------------------------------
+# SAWPublisher — Transmissão TCP não-bloqueante
+# ---------------------------------------------------------------------------
+
+class SAWPublisher:
+    """Envia eventos capturados via TCP socket para um host remoto.
+
+    Resiliência: se a conexão falhar, exibe aviso e continua capturando.
+    Reconecta automaticamente a cada tentativa de envio.
+    """
+
+    def __init__(self, host, port, timeout=2):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._sock = None
+        self._connected = False
+        self._fail_count = 0
+
+    def _connect(self):
+        """Tenta estabelecer conexão TCP. Não bloqueia em caso de falha."""
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(self.timeout)
+            self._sock.connect((self.host, self.port))
+            self._connected = True
+            self._fail_count = 0
+            print(f"[REDE] Conectado a {self.host}:{self.port}")
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            self._connected = False
+            self._cleanup_socket()
+            if self._fail_count == 0:
+                print(f"[REDE] Falha ao conectar em {self.host}:{self.port} — {e}")
+                print(f"[REDE] Continuando captura local. Tentando reconectar a cada evento.")
+            self._fail_count += 1
+
+    def send(self, event_dict):
+        """Envia um evento JSON via TCP. Não-bloqueante em caso de falha."""
+        if not self._connected:
+            self._connect()
+        if not self._connected:
+            return False
+        try:
+            payload = json.dumps(event_dict, ensure_ascii=False) + "\n"
+            self._sock.sendall(payload.encode("utf-8"))
+            return True
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as e:
+            self._connected = False
+            self._cleanup_socket()
+            if self._fail_count == 0:
+                print(f"[REDE] Falha ao transmitir — {e}")
+            self._fail_count += 1
+            return False
+
+    def _cleanup_socket(self):
+        """Fecha socket de forma segura."""
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def close(self):
+        """Encerra conexão."""
+        self._cleanup_socket()
+        self._connected = False
+        if self._fail_count > 0:
+            print(f"[REDE] Total de falhas de transmissão: {self._fail_count}")
+        else:
+            print(f"[REDE] Conexão com {self.host}:{self.port} encerrada.")
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -192,7 +267,7 @@ def interactive_setup():
     print("=" * 60)
 
     # --- Passo 1: Interface ---
-    print("\n[Passo 1/3] Selecione a interface de rede")
+    print("\n[Passo 1/4] Selecione a interface de rede")
     print("-" * 60)
     ifaces = list_interfaces()
     if not ifaces:
@@ -219,7 +294,7 @@ def interactive_setup():
     print(f"  -> Selecionado: {interface}")
 
     # --- Passo 2: Porta ---
-    print(f"\n[Passo 2/3] Filtrar por porta?")
+    print(f"\n[Passo 2/4] Filtrar por porta?")
     print("-" * 60)
     print("  Portas comuns:")
     print("    80/443  — HTTP/HTTPS (trafego web)")
@@ -245,7 +320,7 @@ def interactive_setup():
         print(f"  -> Modo generico: capturando todas as portas")
 
     # --- Passo 3: Tamanho do payload ---
-    print(f"\n[Passo 3/3] Tamanho maximo do payload")
+    print(f"\n[Passo 3/4] Tamanho maximo do payload")
     print("-" * 60)
     print("  Valores recomendados:")
     print("    256   — Leve (apenas cabecalhos HTTP, ideal para alto volume)")
@@ -265,20 +340,46 @@ def interactive_setup():
 
     print(f"  -> Payload maximo: {size} bytes")
 
+    # --- Passo 4: Transmissão remota ---
+    print(f"\n[Passo 4/4] Transmissao remota (opcional)")
+    print("-" * 60)
+    print("  Enviar eventos via TCP para outra maquina?")
+    print("  Isso permite monitorar remotamente sem acessar o servidor.")
+    print("  Use 127.0.0.1 para tunel SSH local (bypass de firewall).")
+    print("")
+    remote_host = input("  IP do destino [Enter = desativado]: ").strip()
+
+    remote_port = 9999
+    if remote_host:
+        while True:
+            choice = input(f"  Porta do destino [padrao: 9999]: ").strip()
+            if choice == "":
+                break
+            if choice.isdigit() and 1 <= int(choice) <= 65535:
+                remote_port = int(choice)
+                break
+            print("  Porta invalida. Use um valor entre 1 e 65535.")
+        print(f"  -> Transmitindo para: {remote_host}:{remote_port}")
+    else:
+        remote_host = None
+        print(f"  -> Apenas captura local (sem transmissao remota)")
+
     # --- Resumo ---
     mode = f"porta {port}" if port else "todas as portas"
+    remote_label = f"{remote_host}:{remote_port}" if remote_host else "desativado"
     print(f"\n{'=' * 60}")
     print(f"  Resumo da configuracao:")
     print(f"    Interface:  {interface}")
     print(f"    Filtro:     {mode}")
     print(f"    Payload:    {size} bytes")
+    print(f"    Remoto:     {remote_label}")
     print(f"{'=' * 60}")
     confirm = input("  Iniciar captura? [S/n]: ").strip().lower()
     if confirm in ("n", "nao", "no"):
         print("  Captura cancelada.")
         sys.exit(0)
 
-    return interface, port, size
+    return interface, port, size, remote_host, remote_port
 
 
 def ip_to_str(ip_int):
@@ -330,10 +431,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Exemplos:
-  sudo python3 saw_ebpf.py                        # Modo interativo (guiado)
-  sudo python3 saw_ebpf.py -i lo -s 2048          # Captura tudo na loopback
-  sudo python3 saw_ebpf.py -i eth0 -p 9090        # Filtra porta 9090
-  sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512   # HTTP, payload até 512 bytes
+  sudo python3 saw_ebpf.py                                    # Modo interativo (guiado)
+  sudo python3 saw_ebpf.py -i lo -s 2048                      # Captura tudo na loopback
+  sudo python3 saw_ebpf.py -i eth0 -p 9090                    # Filtra porta 9090
+  sudo python3 saw_ebpf.py -i lo --remote-host 127.0.0.1      # Transmite via TCP
+  sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512               # HTTP, payload até 512 bytes
 """,
     )
     parser.add_argument(
@@ -348,6 +450,14 @@ Exemplos:
         "-s", "--size", type=int, default=1024,
         help="Tamanho máximo do payload capturado em bytes (default: 1024)",
     )
+    parser.add_argument(
+        "--remote-host", default=None,
+        help="IP de destino para transmissão TCP dos eventos (ex: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--remote-port", type=int, default=9999,
+        help="Porta de destino para transmissão TCP (default: 9999)",
+    )
     args = parser.parse_args()
 
     # --- Validações de ambiente ---
@@ -356,11 +466,13 @@ Exemplos:
 
     # --- Modo interativo ou CLI direto ---
     if args.interface is None:
-        interface, port, size = interactive_setup()
+        interface, port, size, remote_host, remote_port = interactive_setup()
     else:
         interface = args.interface
         port = args.port
         size = args.size
+        remote_host = args.remote_host
+        remote_port = args.remote_port
 
     # Garantir que o tamanho seja potência de 2 (exigência do mask no eBPF)
     payload_size = 1
@@ -373,6 +485,12 @@ Exemplos:
     c_code = BPF_C_SOURCE
     c_code = c_code.replace("__MAX_PAYLOAD_SIZE__", str(payload_size))
     c_code = c_code.replace("__TARGET_PORT__", str(port))
+
+    # --- Inicializar publisher remoto (se configurado) ---
+    publisher = None
+    if remote_host:
+        publisher = SAWPublisher(remote_host, remote_port)
+        print(f"[*] Transmissão remota: {remote_host}:{remote_port} (TCP)")
 
     mode = f"porta {port}" if port else "todas as portas (modo genérico)"
     print(f"[*] Interface: {interface}")
@@ -411,30 +529,48 @@ Exemplos:
         evt = ctypes.cast(data, ctypes.POINTER(PktEvent)).contents
 
         proto_name = "TCP" if evt.protocol == IPPROTO_TCP else "UDP"
-        src = f"{ip_to_str(evt.src_ip)}:{evt.src_port}"
-        dst = f"{ip_to_str(evt.dst_ip)}:{evt.dst_port}"
+        src_ip = ip_to_str(evt.src_ip)
+        dst_ip = ip_to_str(evt.dst_ip)
+        src = f"{src_ip}:{evt.src_port}"
+        dst = f"{dst_ip}:{evt.dst_port}"
         plen = evt.payload_len
 
         payload_bytes = bytes(evt.payload[:plen])
-
-        # --- Saída formatada ---
-        print(f"\n{'='*78}")
-        print(f"  PKT #{pkt_count}  |  {proto_name}  {src} -> {dst}  |  {plen} bytes")
-        print(f"{'='*78}")
-
-        # Hexadecimal
-        print("\n  [HEX]")
-        print(format_hex(payload_bytes))
+        payload_hex = payload_bytes.hex()
 
         # UTF-8 / String (substitui bytes não-imprimíveis por '.')
         try:
             text = payload_bytes.decode("utf-8", errors="replace")
         except Exception:
             text = payload_bytes.decode("latin-1", errors="replace")
-        # Limpar caracteres de controle para exibição
         clean = "".join(c if c.isprintable() or c in ("\n", "\r", "\t") else "." for c in text)
+
+        # --- Saída local formatada ---
+        print(f"\n{'='*78}")
+        print(f"  PKT #{pkt_count}  |  {proto_name}  {src} -> {dst}  |  {plen} bytes")
+        print(f"{'='*78}")
+
+        print("\n  [HEX]")
+        print(format_hex(payload_bytes))
+
         print(f"\n  [UTF-8/STRING]")
         print(f"  {clean}")
+
+        # --- Transmissão remota (se configurado) ---
+        if publisher:
+            event_json = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "pkt_number": pkt_count,
+                "protocol": proto_name,
+                "src_ip": src_ip,
+                "src_port": evt.src_port,
+                "dst_ip": dst_ip,
+                "dst_port": evt.dst_port,
+                "payload_size": plen,
+                "payload_hex": payload_hex,
+                "payload_string": clean,
+            }
+            publisher.send(event_json)
 
     # --- Registrar callback no ring buffer ---
     bpf["events"].open_ring_buffer(handle_event)
@@ -459,6 +595,8 @@ Exemplos:
     finally:
         # Fail-Open: BCC remove automaticamente os programas eBPF ao sair,
         # garantindo que o sistema legado não seja afetado.
+        if publisher:
+            publisher.close()
         print(f"\n[*] Total de pacotes capturados: {pkt_count}")
         print("[*] Programa eBPF removido. Sistema limpo (Fail-Open).")
         bpf.cleanup()

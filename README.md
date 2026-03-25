@@ -75,7 +75,7 @@ O assistente interativo apresenta:
   SAW_eBPF — Configuração Interativa
 ============================================================
 
-[Passo 1/3] Selecione a interface de rede
+[Passo 1/4] Selecione a interface de rede
 ------------------------------------------------------------
   #    Interface        Estado     Endereço IP
   ———— ———————————————— —————————— ————————————————————
@@ -85,7 +85,7 @@ O assistente interativo apresenta:
 
   Digite o numero da interface [1-3]: 1
 
-[Passo 2/3] Filtrar por porta?
+[Passo 2/4] Filtrar por porta?
 ------------------------------------------------------------
   Portas comuns:
     80/443  — HTTP/HTTPS (trafego web)
@@ -97,7 +97,7 @@ O assistente interativo apresenta:
 
   Digite a porta para filtrar [0 = todas]: 9090
 
-[Passo 3/3] Tamanho maximo do payload
+[Passo 3/4] Tamanho maximo do payload
 ------------------------------------------------------------
   Valores recomendados:
     256   — Leve (apenas cabecalhos HTTP, ideal para alto volume)
@@ -107,11 +107,21 @@ O assistente interativo apresenta:
 
   Tamanho em bytes [padrao: 1024]: 2048
 
+[Passo 4/4] Transmissao remota (opcional)
+------------------------------------------------------------
+  Enviar eventos via TCP para outra maquina?
+  Use 127.0.0.1 para tunel SSH local (bypass de firewall).
+
+  IP do destino [Enter = desativado]: 127.0.0.1
+  Porta do destino [padrao: 9999]: 9999
+  -> Transmitindo para: 127.0.0.1:9999
+
 ============================================================
   Resumo da configuracao:
     Interface:  eth0
     Filtro:     porta 9090
     Payload:    2048 bytes
+    Remoto:     127.0.0.1:9999
 ============================================================
   Iniciar captura? [S/n]: S
 ```
@@ -129,17 +139,85 @@ sudo python3 saw_ebpf.py -i eth0 -p 9090
 
 # Monitorar HTTP com payload reduzido
 sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512
+
+# Capturar e transmitir via TCP para outra máquina
+sudo python3 saw_ebpf.py -i lo --remote-host 127.0.0.1 --remote-port 9999
 ```
 
 ### Opções da CLI
 
 ```
 uso: saw_ebpf.py [-h] [-i INTERFACE] [-p PORT] [-s SIZE]
+                 [--remote-host HOST] [--remote-port PORT]
 
-  -i, --interface   Interface de rede. Sem este argumento, entra no modo interativo.
-  -p, --port        Porta para filtrar (padrão: 0 = todas as portas)
-  -s, --size        Tamanho máximo do payload em bytes (padrão: 1024)
+  -i, --interface     Interface de rede. Sem este argumento, entra no modo interativo.
+  -p, --port          Porta para filtrar (padrão: 0 = todas as portas)
+  -s, --size          Tamanho máximo do payload em bytes (padrão: 1024)
+  --remote-host       IP de destino para transmissão TCP dos eventos
+  --remote-port       Porta de destino para transmissão TCP (padrão: 9999)
 ```
+
+## Transmissão Remota
+
+O SAW_eBPF pode enviar cada evento capturado via **TCP** em formato **JSON** para uma máquina remota.
+
+### Como funciona
+
+```
+┌─ Máquina Monitorada ─────────────────────┐     ┌─ Sua Máquina ──────────┐
+│                                           │     │                        │
+│  saw_ebpf.py ──TCP──► 127.0.0.1:9999 ────────► │  Receptor (nc/script)  │
+│     │                (túnel SSH)          │     │                        │
+│     └── saída local (terminal)            │     └────────────────────────┘
+└───────────────────────────────────────────┘
+```
+
+### Receber eventos na sua máquina
+
+**Opção 1 — netcat (teste rápido):**
+
+```bash
+nc -lk 9999
+```
+
+**Opção 2 — via túnel SSH (bypass de firewall):**
+
+```bash
+# Na sua máquina: cria túnel reverso
+ssh -R 9999:localhost:9999 root@IP_DO_SERVIDOR
+
+# No servidor (dentro do SSH): inicia captura
+cd saw_ebpf
+sudo python3 saw_ebpf.py -i eth0 --remote-host 127.0.0.1
+
+# Na sua máquina (outro terminal): recebe os eventos
+nc -lk 9999
+```
+
+### Formato JSON transmitido
+
+Cada linha enviada é um JSON independente (NDJSON):
+
+```json
+{
+  "timestamp": "2026-03-25T15:30:45-0300",
+  "pkt_number": 1,
+  "protocol": "TCP",
+  "src_ip": "192.168.1.10",
+  "src_port": 45832,
+  "dst_ip": "192.168.1.1",
+  "dst_port": 9090,
+  "payload_size": 128,
+  "payload_hex": "474554202f6170692f76312f67707320...",
+  "payload_string": "GET /api/v1/gps HTTP/1.1..."
+}
+```
+
+### Resiliência
+
+- Se o destino remoto não estiver acessível, o SAW_eBPF **continua capturando localmente**.
+- Exibe `[REDE] Falha ao transmitir` e tenta reconectar automaticamente a cada evento.
+- A captura no kernel **nunca é interrompida** por falha de rede.
 
 ## Formato de Saída
 
