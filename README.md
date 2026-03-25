@@ -107,12 +107,12 @@ O assistente interativo apresenta:
 
   Tamanho em bytes [padrao: 1024]: 2048
 
-[Passo 4/4] Transmissao remota (opcional)
+[Passo 4/4] Transmissao remota
 ------------------------------------------------------------
-  Enviar eventos via TCP para outra maquina?
+  Os eventos capturados serao enviados via TCP para sua maquina.
   Use 127.0.0.1 para tunel SSH local (bypass de firewall).
 
-  IP do destino [Enter = desativado]: 127.0.0.1
+  IP do destino (ex: 127.0.0.1): 127.0.0.1
   Porta do destino [padrao: 9999]: 9999
   -> Transmitindo para: 127.0.0.1:9999
 
@@ -131,17 +131,14 @@ O assistente interativo apresenta:
 Para automação ou uso avançado, passe os argumentos diretamente:
 
 ```bash
-# Capturar tudo na loopback (APIs locais de teste)
-sudo python3 saw_ebpf.py -i lo -s 2048
+# Capturar tudo na loopback e transmitir para localhost
+sudo python3 saw_ebpf.py -i lo -s 2048 --remote-host 127.0.0.1
 
-# Monitorar uma porta específica (ex: GPS na porta 9090)
-sudo python3 saw_ebpf.py -i eth0 -p 9090
+# Monitorar porta 9090 e transmitir via túnel SSH
+sudo python3 saw_ebpf.py -i eth0 -p 9090 --remote-host 127.0.0.1
 
-# Monitorar HTTP com payload reduzido
-sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512
-
-# Capturar e transmitir via TCP para outra máquina
-sudo python3 saw_ebpf.py -i lo --remote-host 127.0.0.1 --remote-port 9999
+# Monitorar HTTP com payload reduzido, porta remota customizada
+sudo python3 saw_ebpf.py -i eth0 -p 80 -s 512 --remote-host 192.168.1.5 --remote-port 8888
 ```
 
 ### Opções da CLI
@@ -153,7 +150,7 @@ uso: saw_ebpf.py [-h] [-i INTERFACE] [-p PORT] [-s SIZE]
   -i, --interface     Interface de rede. Sem este argumento, entra no modo interativo.
   -p, --port          Porta para filtrar (padrão: 0 = todas as portas)
   -s, --size          Tamanho máximo do payload em bytes (padrão: 1024)
-  --remote-host       IP de destino para transmissão TCP dos eventos
+  --remote-host       IP de destino para transmissão TCP (obrigatório no modo CLI)
   --remote-port       Porta de destino para transmissão TCP (padrão: 9999)
 ```
 

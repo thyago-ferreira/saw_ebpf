@@ -341,32 +341,32 @@ def interactive_setup():
     print(f"  -> Payload maximo: {size} bytes")
 
     # --- Passo 4: Transmissão remota ---
-    print(f"\n[Passo 4/4] Transmissao remota (opcional)")
+    print(f"\n[Passo 4/4] Transmissao remota")
     print("-" * 60)
-    print("  Enviar eventos via TCP para outra maquina?")
-    print("  Isso permite monitorar remotamente sem acessar o servidor.")
+    print("  Os eventos capturados serao enviados via TCP para sua maquina.")
     print("  Use 127.0.0.1 para tunel SSH local (bypass de firewall).")
     print("")
-    remote_host = input("  IP do destino [Enter = desativado]: ").strip()
+
+    while True:
+        remote_host = input("  IP do destino (ex: 127.0.0.1): ").strip()
+        if remote_host:
+            break
+        print("  IP obrigatorio. Informe o endereco de destino.")
 
     remote_port = 9999
-    if remote_host:
-        while True:
-            choice = input(f"  Porta do destino [padrao: 9999]: ").strip()
-            if choice == "":
-                break
-            if choice.isdigit() and 1 <= int(choice) <= 65535:
-                remote_port = int(choice)
-                break
-            print("  Porta invalida. Use um valor entre 1 e 65535.")
-        print(f"  -> Transmitindo para: {remote_host}:{remote_port}")
-    else:
-        remote_host = None
-        print(f"  -> Apenas captura local (sem transmissao remota)")
+    while True:
+        choice = input(f"  Porta do destino [padrao: 9999]: ").strip()
+        if choice == "":
+            break
+        if choice.isdigit() and 1 <= int(choice) <= 65535:
+            remote_port = int(choice)
+            break
+        print("  Porta invalida. Use um valor entre 1 e 65535.")
+    print(f"  -> Transmitindo para: {remote_host}:{remote_port}")
 
     # --- Resumo ---
     mode = f"porta {port}" if port else "todas as portas"
-    remote_label = f"{remote_host}:{remote_port}" if remote_host else "desativado"
+    remote_label = f"{remote_host}:{remote_port}"
     print(f"\n{'=' * 60}")
     print(f"  Resumo da configuracao:")
     print(f"    Interface:  {interface}")
@@ -452,7 +452,7 @@ Exemplos:
     )
     parser.add_argument(
         "--remote-host", default=None,
-        help="IP de destino para transmissão TCP dos eventos (ex: 127.0.0.1)",
+        help="IP de destino para transmissão TCP dos eventos (obrigatório no modo CLI)",
     )
     parser.add_argument(
         "--remote-port", type=int, default=9999,
@@ -468,6 +468,8 @@ Exemplos:
     if args.interface is None:
         interface, port, size, remote_host, remote_port = interactive_setup()
     else:
+        if args.remote_host is None:
+            parser.error("--remote-host é obrigatório. Ex: --remote-host 127.0.0.1")
         interface = args.interface
         port = args.port
         size = args.size
@@ -486,11 +488,9 @@ Exemplos:
     c_code = c_code.replace("__MAX_PAYLOAD_SIZE__", str(payload_size))
     c_code = c_code.replace("__TARGET_PORT__", str(port))
 
-    # --- Inicializar publisher remoto (se configurado) ---
-    publisher = None
-    if remote_host:
-        publisher = SAWPublisher(remote_host, remote_port)
-        print(f"[*] Transmissão remota: {remote_host}:{remote_port} (TCP)")
+    # --- Inicializar publisher remoto ---
+    publisher = SAWPublisher(remote_host, remote_port)
+    print(f"[*] Transmissão remota: {remote_host}:{remote_port} (TCP)")
 
     mode = f"porta {port}" if port else "todas as portas (modo genérico)"
     print(f"[*] Interface: {interface}")
@@ -556,21 +556,20 @@ Exemplos:
         print(f"\n  [UTF-8/STRING]")
         print(f"  {clean}")
 
-        # --- Transmissão remota (se configurado) ---
-        if publisher:
-            event_json = {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "pkt_number": pkt_count,
-                "protocol": proto_name,
-                "src_ip": src_ip,
-                "src_port": evt.src_port,
-                "dst_ip": dst_ip,
-                "dst_port": evt.dst_port,
-                "payload_size": plen,
-                "payload_hex": payload_hex,
-                "payload_string": clean,
-            }
-            publisher.send(event_json)
+        # --- Transmissão remota ---
+        event_json = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "pkt_number": pkt_count,
+            "protocol": proto_name,
+            "src_ip": src_ip,
+            "src_port": evt.src_port,
+            "dst_ip": dst_ip,
+            "dst_port": evt.dst_port,
+            "payload_size": plen,
+            "payload_hex": payload_hex,
+            "payload_string": clean,
+        }
+        publisher.send(event_json)
 
     # --- Registrar callback no ring buffer ---
     bpf["events"].open_ring_buffer(handle_event)
@@ -595,8 +594,7 @@ Exemplos:
     finally:
         # Fail-Open: BCC remove automaticamente os programas eBPF ao sair,
         # garantindo que o sistema legado não seja afetado.
-        if publisher:
-            publisher.close()
+        publisher.close()
         print(f"\n[*] Total de pacotes capturados: {pkt_count}")
         print("[*] Programa eBPF removido. Sistema limpo (Fail-Open).")
         bpf.cleanup()
