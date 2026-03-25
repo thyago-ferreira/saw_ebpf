@@ -31,22 +31,21 @@ BPF_C_SOURCE = r"""
 #include <uapi/linux/tcp.h>
 #include <uapi/linux/udp.h>
 
-#define MAX_PAYLOAD_SIZE __MAX_PAYLOAD_SIZE__
-#define TARGET_PORT      __TARGET_PORT__
+#define TARGET_PORT __TARGET_PORT__
 
-/* Estrutura enviada ao user-space via ring buffer */
-struct pkt_event {
+/* Metadados enviados ao user-space (prefixo do perf event) */
+struct pkt_meta {
     u32 src_ip;
     u32 dst_ip;
     u16 src_port;
     u16 dst_port;
-    u8  protocol;       /* IPPROTO_TCP ou IPPROTO_UDP */
-    u16 payload_len;
-    u8  payload[MAX_PAYLOAD_SIZE];
+    u8  protocol;
+    u8  _pad;
+    u32 payload_offset;
+    u32 payload_len;
 };
 
-/* Ring buffer — alta performance, sem perda por contention */
-BPF_RINGBUF_OUTPUT(events, 256);  /* 256 páginas = 1 MiB */
+BPF_PERF_OUTPUT(events);
 
 int saw_socket_filter(struct __sk_buff *skb)
 {
@@ -54,7 +53,6 @@ int saw_socket_filter(struct __sk_buff *skb)
     u16 eth_proto;
     bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_proto), &eth_proto, 2);
 
-    /* Aceitar apenas IPv4 */
     if (eth_proto != htons(ETH_P_IP))
         return 0;
 
@@ -100,34 +98,21 @@ int saw_socket_filter(struct __sk_buff *skb)
         return 0;
 
     u32 payload_len = pkt_len - payload_offset;
-    if (payload_len >= MAX_PAYLOAD_SIZE)
-        payload_len = MAX_PAYLOAD_SIZE - 1;
-    if (payload_len == 0)
-        return 0;
 
-    /* Bitmask + barreira de compilador: impede que o Clang otimize
-       e remova a prova de limite que o verificador 5.10 exige.
-       Sem o asm volatile, o Clang elimina o & por considerar redundante
-       após o if acima, mas o verificador não acompanha essa lógica. */
-    payload_len &= (MAX_PAYLOAD_SIZE - 1);
-    asm volatile("" : "+r"(payload_len));
+    /* --- Enviar metadados + pacote bruto via perf buffer ---
+       perf_submit_skb envia o pacote inteiro (L2+) junto com o struct,
+       sem precisar de bpf_skb_load_bytes para o payload.
+       Isso evita o problema do verificador 5.10 com R4 variable-length. */
+    struct pkt_meta meta = {};
+    meta.src_ip    = iph.saddr;
+    meta.dst_ip    = iph.daddr;
+    meta.src_port  = src_port;
+    meta.dst_port  = dst_port;
+    meta.protocol  = protocol;
+    meta.payload_offset = payload_offset;
+    meta.payload_len    = payload_len;
 
-    /* --- Reservar espaço no ring buffer --- */
-    struct pkt_event *evt = events.ringbuf_reserve(sizeof(struct pkt_event));
-    if (!evt)
-        return 0;
-
-    evt->src_ip    = iph.saddr;
-    evt->dst_ip    = iph.daddr;
-    evt->src_port  = src_port;
-    evt->dst_port  = dst_port;
-    evt->protocol  = protocol;
-    evt->payload_len = payload_len;
-
-    __builtin_memset(evt->payload, 0, MAX_PAYLOAD_SIZE);
-    bpf_skb_load_bytes(skb, payload_offset, evt->payload, payload_len);
-
-    events.ringbuf_submit(evt, 0);
+    events.perf_submit_skb(skb, skb->len, &meta, sizeof(meta));
     return 0;
 }
 """
@@ -410,22 +395,18 @@ def format_hex(data, width=16):
     return "\n".join(lines)
 
 
-def build_event_struct(max_payload_size):
-    """Cria ctypes struct alinhada com a struct pkt_event do eBPF."""
-
-    class PktEvent(ctypes.Structure):
-        _fields_ = [
-            ("src_ip",      ctypes.c_uint32),
-            ("dst_ip",      ctypes.c_uint32),
-            ("src_port",    ctypes.c_uint16),
-            ("dst_port",    ctypes.c_uint16),
-            ("protocol",    ctypes.c_uint8),
-            ("_pad",        ctypes.c_uint8),       # padding natural
-            ("payload_len", ctypes.c_uint16),
-            ("payload",     ctypes.c_uint8 * max_payload_size),
-        ]
-
-    return PktEvent
+class PktMeta(ctypes.Structure):
+    """Metadados do pacote — espelha struct pkt_meta do eBPF."""
+    _fields_ = [
+        ("src_ip",         ctypes.c_uint32),
+        ("dst_ip",         ctypes.c_uint32),
+        ("src_port",       ctypes.c_uint16),
+        ("dst_port",       ctypes.c_uint16),
+        ("protocol",       ctypes.c_uint8),
+        ("_pad",           ctypes.c_uint8),
+        ("payload_offset", ctypes.c_uint32),
+        ("payload_len",    ctypes.c_uint32),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -483,16 +464,11 @@ Exemplos:
         remote_host = args.remote_host
         remote_port = args.remote_port
 
-    # Garantir que o tamanho seja potência de 2 (exigência do mask no eBPF)
-    payload_size = 1
-    while payload_size < size:
-        payload_size <<= 1
-    if payload_size != size:
-        print(f"[INFO] Tamanho ajustado para {payload_size} (potência de 2 mais próxima).")
+    # Tamanho máximo do payload (usado no Python para truncar a saída)
+    payload_size = size
 
     # --- Injeção de variáveis no código C ---
     c_code = BPF_C_SOURCE
-    c_code = c_code.replace("__MAX_PAYLOAD_SIZE__", str(payload_size))
     c_code = c_code.replace("__TARGET_PORT__", str(port))
 
     # --- Inicializar publisher remoto ---
@@ -525,24 +501,32 @@ Exemplos:
     print(f"[*] Socket filter anexado a '{interface}'. Capturando...")
     print("-" * 78)
 
-    # --- Estrutura de evento ---
-    PktEvent = build_event_struct(payload_size)
+    # --- Estrutura de metadados ---
+    meta_size = ctypes.sizeof(PktMeta)
     pkt_count = 0
 
-    # --- Callback do ring buffer ---
-    def handle_event(ctx, data, size):
+    # --- Callback do perf buffer ---
+    def handle_event(cpu, data, size):
         nonlocal pkt_count
         pkt_count += 1
-        evt = ctypes.cast(data, ctypes.POINTER(PktEvent)).contents
 
-        proto_name = "TCP" if evt.protocol == IPPROTO_TCP else "UDP"
-        src_ip = ip_to_str(evt.src_ip)
-        dst_ip = ip_to_str(evt.dst_ip)
-        src = f"{src_ip}:{evt.src_port}"
-        dst = f"{dst_ip}:{evt.dst_port}"
-        plen = evt.payload_len
+        # Parsear metadados (início do buffer)
+        meta = ctypes.cast(data, ctypes.POINTER(PktMeta)).contents
 
-        payload_bytes = bytes(evt.payload[:plen])
+        proto_name = "TCP" if meta.protocol == IPPROTO_TCP else "UDP"
+        src_ip = ip_to_str(meta.src_ip)
+        dst_ip = ip_to_str(meta.dst_ip)
+        src = f"{src_ip}:{meta.src_port}"
+        dst = f"{dst_ip}:{meta.dst_port}"
+
+        # Extrair payload do pacote bruto (após os metadados)
+        raw_pkt = bytes(ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8 * size)).contents)
+        pkt_data = raw_pkt[meta_size:]  # pacote bruto (L2+)
+        p_off = meta.payload_offset
+        p_len = min(meta.payload_len, payload_size, len(pkt_data) - p_off)
+        if p_len <= 0 or p_off >= len(pkt_data):
+            return
+        payload_bytes = pkt_data[p_off:p_off + p_len]
         payload_hex = payload_bytes.hex()
 
         # UTF-8 / String (substitui bytes não-imprimíveis por '.')
@@ -554,7 +538,7 @@ Exemplos:
 
         # --- Saída local formatada ---
         print(f"\n{'='*78}")
-        print(f"  PKT #{pkt_count}  |  {proto_name}  {src} -> {dst}  |  {plen} bytes")
+        print(f"  PKT #{pkt_count}  |  {proto_name}  {src} -> {dst}  |  {p_len} bytes")
         print(f"{'='*78}")
 
         print("\n  [HEX]")
@@ -569,17 +553,17 @@ Exemplos:
             "pkt_number": pkt_count,
             "protocol": proto_name,
             "src_ip": src_ip,
-            "src_port": evt.src_port,
+            "src_port": meta.src_port,
             "dst_ip": dst_ip,
-            "dst_port": evt.dst_port,
-            "payload_size": plen,
+            "dst_port": meta.dst_port,
+            "payload_size": p_len,
             "payload_hex": payload_hex,
             "payload_string": clean,
         }
         publisher.send(event_json)
 
-    # --- Registrar callback no ring buffer ---
-    bpf["events"].open_ring_buffer(handle_event)
+    # --- Registrar callback no perf buffer ---
+    bpf["events"].open_perf_buffer(handle_event, page_cnt=64)
 
     # --- Tratamento de sinal para Fail-Open ---
     running = True
@@ -595,7 +579,7 @@ Exemplos:
     # --- Loop principal ---
     try:
         while running:
-            bpf.ring_buffer_poll(timeout=100)
+            bpf.perf_buffer_poll(timeout=100)
     except Exception as e:
         print(f"\n[ERRO] Exceção no loop principal: {e}")
     finally:
